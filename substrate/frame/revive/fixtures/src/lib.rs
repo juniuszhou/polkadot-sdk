@@ -19,20 +19,53 @@
 
 extern crate alloc;
 
-/// Load a given wasm module and returns a wasm binary contents along with it's hash.
+// generated file that tells us where to find the fixtures
+include!(concat!(env!("OUT_DIR"), "/fixture_location.rs"));
+
+/// Enum for different fixture types
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixtureType {
+	/// Polkavm (compiled Rust contracts)
+	Rust,
+	/// Resolc (compiled Solidity contracts to Polkavm)
+	Resolc,
+	/// Solc (compiled Solidity contracts to EVM bytecode)
+	Solc,
+	/// Solc Runtime (compiled Solidity contracts to EVM runtime bytecode)
+	SolcRuntime,
+}
+
 #[cfg(feature = "std")]
-pub fn compile_module<T>(
+impl FixtureType {
+	fn file_extension(&self) -> &'static str {
+		match self {
+			Self::Rust => ".polkavm",
+			Self::Resolc => ".resolc.polkavm",
+			Self::Solc => ".sol.bin",
+			Self::SolcRuntime => ".sol.runtime.bin",
+		}
+	}
+}
+
+/// Load a fixture module with the specified type and return binary contents along with its hash.
+#[cfg(feature = "std")]
+pub fn compile_module_with_type(
 	fixture_name: &str,
-) -> anyhow::Result<(Vec<u8>, <T::Hashing as sp_runtime::traits::Hash>::Output)>
-where
-	T: frame_system::Config,
-{
-	use sp_runtime::traits::Hash;
-	let out_dir: std::path::PathBuf = env!("OUT_DIR").into();
-	let fixture_path = out_dir.join(format!("{fixture_name}.polkavm"));
-	let binary = std::fs::read(fixture_path)?;
-	let code_hash = T::Hashing::hash(&binary);
-	Ok((binary, code_hash))
+	fixture_type: FixtureType,
+) -> anyhow::Result<(Vec<u8>, sp_core::H256)> {
+	use anyhow::Context;
+	let out_dir: std::path::PathBuf = FIXTURE_DIR.into();
+	let fixture_path = out_dir.join(format!("{fixture_name}{}", fixture_type.file_extension()));
+	let binary = std::fs::read(&fixture_path)
+		.with_context(|| format!("Failed to load fixture {fixture_path:?}"))?;
+	let code_hash = sp_io::hashing::keccak_256(&binary);
+	Ok((binary, sp_core::H256(code_hash)))
+}
+
+/// Load a given polkavm module and returns a polkavm binary contents along with its hash.
+#[cfg(feature = "std")]
+pub fn compile_module(fixture_name: &str) -> anyhow::Result<(Vec<u8>, sp_core::H256)> {
+	compile_module_with_type(fixture_name, FixtureType::Rust)
 }
 
 /// Fixtures used in runtime benchmarks.
@@ -41,25 +74,19 @@ where
 /// available in no-std environments (runtime benchmarks).
 pub mod bench {
 	use alloc::vec::Vec;
+	pub const DUMMY: Option<&[u8]> = fixture!("dummy");
+	pub const NOOP: Option<&[u8]> = fixture!("noop");
 
-	#[cfg(feature = "riscv")]
-	macro_rules! fixture {
-		($name: literal) => {
-			include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".polkavm"))
-		};
+	pub fn dummy() -> &'static [u8] {
+		DUMMY.expect("`DUMMY` fixture not available, remove `SKIP_PALLET_REVIVE_FIXTURES` env variable to compile them.")
 	}
-	#[cfg(not(feature = "riscv"))]
-	macro_rules! fixture {
-		($name: literal) => {
-			&[]
-		};
+
+	pub fn noop() -> &'static [u8] {
+		NOOP.expect("`NOOP` fixture not available, remove `SKIP_PALLET_REVIVE_FIXTURES` env variable to compile them.")
 	}
-	pub const DUMMY: &[u8] = fixture!("dummy");
-	pub const NOOP: &[u8] = fixture!("noop");
-	pub const INSTR: &[u8] = fixture!("instr_benchmark");
 
 	pub fn dummy_unique(replace_with: u32) -> Vec<u8> {
-		let mut dummy = DUMMY.to_vec();
+		let mut dummy = dummy().to_vec();
 		let idx = dummy
 			.windows(4)
 			.position(|w| w == &[0xDE, 0xAD, 0xBE, 0xEF])
@@ -73,7 +100,7 @@ pub mod bench {
 mod test {
 	#[test]
 	fn out_dir_should_have_compiled_mocks() {
-		let out_dir: std::path::PathBuf = env!("OUT_DIR").into();
+		let out_dir: std::path::PathBuf = crate::FIXTURE_DIR.into();
 		assert!(out_dir.join("dummy.polkavm").exists());
 	}
 }

@@ -17,15 +17,14 @@
 
 use super::{deposit_limit, GAS_LIMIT};
 use crate::{
-	AccountIdLookupOf, AccountIdOf, BalanceOf, Code, CodeHash, CollectEvents, Config,
-	ContractExecResult, ContractInstantiateResult, DebugInfo, EventRecordOf, ExecReturnValue,
-	InstantiateReturnValue, OriginFor, Pallet, Weight,
+	address::AddressMapper, evm::TransactionSigned, AccountIdOf, BalanceOf, Code, Config,
+	ContractResult, ExecConfig, ExecReturnValue, InstantiateReturnValue, OriginFor, Pallet, Weight,
+	U256,
 };
-use codec::{Encode, HasCompact};
-use core::fmt::Debug;
+use alloc::{vec, vec::Vec};
 use frame_support::pallet_prelude::DispatchResultWithPostInfo;
 use paste::paste;
-use scale_info::TypeInfo;
+use sp_core::H160;
 
 /// Helper macro to generate a builder for contract API calls.
 macro_rules! builder {
@@ -50,10 +49,7 @@ macro_rules! builder {
 		}
 
 		#[allow(dead_code)]
-		impl<T: Config> $name<T>
-		where
-			<BalanceOf<T> as HasCompact>::Type: Clone + Eq + PartialEq + Debug + TypeInfo + Encode,
-		{
+		impl<T: Config> $name<T> {
 			$(
 				#[doc = concat!("Set the ", stringify!($field))]
 				pub fn $field(mut self, value: $type) -> Self {
@@ -74,6 +70,11 @@ macro_rules! builder {
 	}
 }
 
+pub struct Contract<T: Config> {
+	pub account_id: AccountIdOf<T>,
+	pub addr: H160,
+}
+
 builder!(
 	instantiate_with_code(
 		origin: OriginFor<T>,
@@ -82,7 +83,7 @@ builder!(
 		storage_deposit_limit: BalanceOf<T>,
 		code: Vec<u8>,
 		data: Vec<u8>,
-		salt: Vec<u8>,
+		salt: Option<[u8; 32]>,
 	) -> DispatchResultWithPostInfo;
 
 	/// Create an [`InstantiateWithCodeBuilder`] with default values.
@@ -94,7 +95,7 @@ builder!(
 			storage_deposit_limit: deposit_limit::<T>(),
 			code,
 			data: vec![],
-			salt: vec![],
+			salt: Some([0; 32]),
 		}
 	}
 );
@@ -105,13 +106,13 @@ builder!(
 		value: BalanceOf<T>,
 		gas_limit: Weight,
 		storage_deposit_limit: BalanceOf<T>,
-		code_hash: CodeHash<T>,
+		code_hash: sp_core::H256,
 		data: Vec<u8>,
-		salt: Vec<u8>,
+		salt: Option<[u8; 32]>,
 	) -> DispatchResultWithPostInfo;
 
 	/// Create an [`InstantiateBuilder`] with default values.
-	pub fn instantiate(origin: OriginFor<T>, code_hash: CodeHash<T>) -> Self {
+	pub fn instantiate(origin: OriginFor<T>, code_hash: sp_core::H256) -> Self {
 		Self {
 			origin,
 			value: 0u32.into(),
@@ -119,7 +120,7 @@ builder!(
 			storage_deposit_limit: deposit_limit::<T>(),
 			code_hash,
 			data: vec![],
-			salt: vec![],
+			salt: Some([0; 32]),
 		}
 	}
 );
@@ -127,37 +128,55 @@ builder!(
 builder!(
 	bare_instantiate(
 		origin: OriginFor<T>,
-		value: BalanceOf<T>,
+		evm_value: U256,
 		gas_limit: Weight,
 		storage_deposit_limit: BalanceOf<T>,
-		code: Code<CodeHash<T>>,
+		code: Code,
 		data: Vec<u8>,
-		salt: Vec<u8>,
-		debug: DebugInfo,
-		collect_events: CollectEvents,
-	) -> ContractInstantiateResult<AccountIdOf<T>, BalanceOf<T>, EventRecordOf<T>>;
+		salt: Option<[u8; 32]>,
+		exec_config: ExecConfig<T>,
+	) -> ContractResult<InstantiateReturnValue, BalanceOf<T>>;
+
+	pub fn concat_evm_data(mut self, more_data: &[u8]) -> Self {
+		let Code::Upload(code) = &mut self.code else {
+			panic!("concat_evm_data should only be used with Code::Upload");
+		};
+		code.extend_from_slice(more_data);
+		self
+	}
+
+	/// Set the call's evm_value using a native_value amount.
+	pub fn native_value(mut self, value: BalanceOf<T>) -> Self {
+		self.evm_value = Pallet::<T>::convert_native_to_evm(value);
+		self
+	}
 
 	/// Build the instantiate call and unwrap the result.
-	pub fn build_and_unwrap_result(self) -> InstantiateReturnValue<AccountIdOf<T>> {
+	pub fn build_and_unwrap_result(self) -> InstantiateReturnValue {
 		self.build().result.unwrap()
 	}
 
 	/// Build the instantiate call and unwrap the account id.
-	pub fn build_and_unwrap_account_id(self) -> AccountIdOf<T> {
-		self.build().result.unwrap().account_id
+	pub fn build_and_unwrap_contract(self) -> Contract<T> {
+		let result = self.build().result.unwrap();
+		assert!(!result.result.did_revert(), "instantiation did revert");
+
+		let addr = result.addr;
+		let account_id = T::AddressMapper::to_account_id(&addr);
+		Contract{ account_id,  addr }
 	}
 
-	pub fn bare_instantiate(origin: OriginFor<T>, code: Code<CodeHash<T>>) -> Self {
+	/// Create a [`BareInstantiateBuilder`] with default values.
+	pub fn bare_instantiate(origin: OriginFor<T>, code: Code) -> Self {
 		Self {
 			origin,
-			value: 0u32.into(),
+			evm_value: Default::default(),
 			gas_limit: GAS_LIMIT,
 			storage_deposit_limit: deposit_limit::<T>(),
 			code,
 			data: vec![],
-			salt: vec![],
-			debug: DebugInfo::UnsafeDebug,
-			collect_events: CollectEvents::Skip,
+			salt: Some([0; 32]),
+			exec_config: ExecConfig::new_substrate_tx(),
 		}
 	}
 );
@@ -165,7 +184,7 @@ builder!(
 builder!(
 	call(
 		origin: OriginFor<T>,
-		dest: AccountIdLookupOf<T>,
+		dest: H160,
 		value: BalanceOf<T>,
 		gas_limit: Weight,
 		storage_deposit_limit: BalanceOf<T>,
@@ -173,7 +192,7 @@ builder!(
 	) -> DispatchResultWithPostInfo;
 
 	/// Create a [`CallBuilder`] with default values.
-	pub fn call(origin: OriginFor<T>, dest: AccountIdLookupOf<T>) -> Self {
+	pub fn call(origin: OriginFor<T>, dest: H160) -> Self {
 		CallBuilder {
 			origin,
 			dest,
@@ -188,14 +207,19 @@ builder!(
 builder!(
 	bare_call(
 		origin: OriginFor<T>,
-		dest: AccountIdOf<T>,
-		value: BalanceOf<T>,
+		dest: H160,
+		evm_value: U256,
 		gas_limit: Weight,
 		storage_deposit_limit: BalanceOf<T>,
 		data: Vec<u8>,
-		debug: DebugInfo,
-		collect_events: CollectEvents,
-	) -> ContractExecResult<BalanceOf<T>, EventRecordOf<T>>;
+		exec_config: ExecConfig<T>,
+	) -> ContractResult<ExecReturnValue, BalanceOf<T>>;
+
+	/// Set the call's evm_value using a native_value amount.
+	pub fn native_value(mut self, value: BalanceOf<T>) -> Self {
+		self.evm_value = Pallet::<T>::convert_native_to_evm(value);
+		self
+	}
 
 	/// Build the call and unwrap the result.
 	pub fn build_and_unwrap_result(self) -> ExecReturnValue {
@@ -203,16 +227,69 @@ builder!(
 	}
 
 	/// Create a [`BareCallBuilder`] with default values.
-	pub fn bare_call(origin: OriginFor<T>, dest: AccountIdOf<T>) -> Self {
+	pub fn bare_call(origin: OriginFor<T>, dest: H160) -> Self {
+		Self {
+			origin,
+			dest,
+			evm_value: Default::default(),
+			gas_limit: GAS_LIMIT,
+			storage_deposit_limit: deposit_limit::<T>(),
+			data: vec![],
+			exec_config: ExecConfig::new_substrate_tx(),
+		}
+	}
+);
+
+builder!(
+	eth_call(
+		origin: OriginFor<T>,
+		dest: H160,
+		value: U256,
+		gas_limit: Weight,
+		data: Vec<u8>,
+		transaction_encoded: Vec<u8>,
+		effective_gas_price: U256,
+		encoded_len: u32,
+	) -> DispatchResultWithPostInfo;
+
+	/// Create a [`EthCallBuilder`] with default values.
+	pub fn eth_call(origin: OriginFor<T>, dest: H160) -> Self {
 		Self {
 			origin,
 			dest,
 			value: 0u32.into(),
 			gas_limit: GAS_LIMIT,
-			storage_deposit_limit: deposit_limit::<T>(),
 			data: vec![],
-			debug: DebugInfo::UnsafeDebug,
-			collect_events: CollectEvents::Skip,
+			transaction_encoded: TransactionSigned::TransactionLegacySigned(Default::default()).signed_payload(),
+			effective_gas_price: 0u32.into(),
+			encoded_len: 0,
+		}
+	}
+);
+
+builder!(
+	eth_instantiate_with_code(
+			origin: OriginFor<T>,
+			value: U256,
+			gas_limit: Weight,
+			code: Vec<u8>,
+			data: Vec<u8>,
+			transaction_encoded: Vec<u8>,
+			effective_gas_price: U256,
+			encoded_len: u32,
+	) -> DispatchResultWithPostInfo;
+
+	/// Create a [`EthInstantiateWithCodeBuilder`] with default values.
+	pub fn eth_instantiate_with_code(origin: OriginFor<T>, code: Vec<u8>) -> Self {
+		Self {
+			origin,
+			value: 0u32.into(),
+			gas_limit: GAS_LIMIT,
+			code,
+			data: vec![],
+			transaction_encoded: TransactionSigned::Transaction4844Signed(Default::default()).signed_payload(),
+			effective_gas_price: 0u32.into(),
+			encoded_len: 0,
 		}
 	}
 );

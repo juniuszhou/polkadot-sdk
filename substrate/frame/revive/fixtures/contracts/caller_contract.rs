@@ -17,9 +17,12 @@
 
 #![no_std]
 #![no_main]
+include!("../panic_handler.rs");
 
-use common::input;
-use uapi::{HostFn, HostFnImpl as api, ReturnErrorCode};
+use uapi::{input, u256_bytes, HostFn, HostFnImpl as api, ReturnErrorCode};
+
+const INPUT: [u8; 8] = [0u8, 1, 34, 51, 68, 85, 102, 119];
+const REVERTED_INPUT: [u8; 7] = [1u8, 34, 51, 68, 85, 102, 119];
 
 #[no_mangle]
 #[polkavm_derive::polkavm_export]
@@ -28,76 +31,89 @@ pub extern "C" fn deploy() {}
 #[no_mangle]
 #[polkavm_derive::polkavm_export]
 pub extern "C" fn call() {
-	input!(code_hash: [u8; 32],);
+	input!(code_hash: &[u8; 32], load_code_ref_time: u64, load_code_proof_size: u64,);
 
 	// The value to transfer on instantiation and calls. Chosen to be greater than existential
 	// deposit.
-	let value = 32768u64.to_le_bytes();
-	let salt = [0u8; 0];
+	let value = u256_bytes(32_768_000_000u64);
+	let salt = [0u8; 32];
 
 	// Callee will use the first 4 bytes of the input to return an exit status.
-	let input = [0u8, 1, 34, 51, 68, 85, 102, 119];
-	let reverted_input = [1u8, 34, 51, 68, 85, 102, 119];
+	let mut input_deploy = [0; 32 + INPUT.len()];
+	input_deploy[..32].copy_from_slice(code_hash);
+	input_deploy[32..].copy_from_slice(&INPUT);
+
+	let mut reverted_input_deploy = [0; 32 + REVERTED_INPUT.len()];
+	reverted_input_deploy[..32].copy_from_slice(code_hash);
+	reverted_input_deploy[32..].copy_from_slice(&REVERTED_INPUT);
 
 	// Fail to deploy the contract since it returns a non-zero exit status.
 	let res = api::instantiate(
-		code_hash,
-		0u64, // How much ref_time weight to devote for the execution. 0 = all.
-		0u64, // How much proof_size weight to devote for the execution. 0 = all.
-		None, // No deposit limit.
+		u64::MAX,       /* How much ref_time weight to devote for the execution. u64::MAX = use
+		                 * all. */
+		u64::MAX, // How much proof_size weight to devote for the execution. u64::MAX = use all.
+		&[u8::MAX; 32], // No deposit limit.
 		&value,
-		&reverted_input,
+		&reverted_input_deploy,
 		None,
 		None,
-		&salt,
+		Some(&salt),
 	);
 	assert!(matches!(res, Err(ReturnErrorCode::CalleeReverted)));
 
 	// Fail to deploy the contract due to insufficient ref_time weight.
 	let res = api::instantiate(
-		code_hash, 1u64, // too little ref_time weight
-		0u64, // How much proof_size weight to devote for the execution. 0 = all.
-		None, // No deposit limit.
-		&value, &input, None, None, &salt,
+		1u64, // too little ref_time weight
+		u64::MAX, /* How much proof_size weight to devote for the execution. u64::MAX =
+		       * use all. */
+		&[u8::MAX; 32], // No deposit limit.
+		&value,
+		&input_deploy,
+		None,
+		None,
+		Some(&salt),
 	);
-	assert!(matches!(res, Err(ReturnErrorCode::CalleeTrapped)));
+	assert!(matches!(res, Err(ReturnErrorCode::OutOfResources)));
 
 	// Fail to deploy the contract due to insufficient proof_size weight.
 	let res = api::instantiate(
-		code_hash, 0u64, // How much ref_time weight to devote for the execution. 0 = all.
-		1u64, // Too little proof_size weight
-		None, // No deposit limit.
-		&value, &input, None, None, &salt,
+		u64::MAX,       /* How much ref_time weight to devote for the execution. u64::MAX = use
+		                 * all. */
+		1u64,           // Too little proof_size weight
+		&[u8::MAX; 32], // No deposit limit.
+		&value,
+		&input_deploy,
+		None,
+		None,
+		Some(&salt),
 	);
-	assert!(matches!(res, Err(ReturnErrorCode::CalleeTrapped)));
+	assert!(matches!(res, Err(ReturnErrorCode::OutOfResources)));
 
 	// Deploy the contract successfully.
-	let mut callee = [0u8; 32];
-	let callee = &mut &mut callee[..];
+	let mut callee = [0u8; 20];
 
 	api::instantiate(
-		code_hash,
-		0u64, // How much ref_time weight to devote for the execution. 0 = all.
-		0u64, // How much proof_size weight to devote for the execution. 0 = all.
-		None, // No deposit limit.
+		u64::MAX,       /* How much ref_time weight to devote for the execution. u64::MAX = use
+		                 * all. */
+		u64::MAX, // How much proof_size weight to devote for the execution. u64::MAX = use all.
+		&[u8::MAX; 32], // No deposit limit.
 		&value,
-		&input,
-		Some(callee),
+		&input_deploy,
+		Some(&mut callee),
 		None,
-		&salt,
+		Some(&salt),
 	)
 	.unwrap();
-	assert_eq!(callee.len(), 32);
 
 	// Call the new contract and expect it to return failing exit code.
 	let res = api::call(
 		uapi::CallFlags::empty(),
-		callee,
-		0u64, // How much ref_time weight to devote for the execution. 0 = all.
-		0u64, // How much proof_size weight to devote for the execution. 0 = all.
-		None, // No deposit limit.
+		&callee,
+		u64::MAX, // How much ref_time weight to devote for the execution. u64::MAX = use all.
+		u64::MAX, // How much proof_size weight to devote for the execution. u64::MAX = use all.
+		&[u8::MAX; 32], // No deposit limit.
 		&value,
-		&reverted_input,
+		&REVERTED_INPUT,
 		None,
 	);
 	assert!(matches!(res, Err(ReturnErrorCode::CalleeReverted)));
@@ -105,41 +121,46 @@ pub extern "C" fn call() {
 	// Fail to call the contract due to insufficient ref_time weight.
 	let res = api::call(
 		uapi::CallFlags::empty(),
-		callee,
-		1u64, // Too little ref_time weight.
-		0u64, // How much proof_size weight to devote for the execution. 0 = all.
-		None, // No deposit limit.
+		&callee,
+		load_code_ref_time,   // just enough to load the contract
+		load_code_proof_size, // just enough to load the contract
+		&[u8::MAX; 32],       // No deposit limit.
 		&value,
-		&input,
+		&INPUT,
 		None,
 	);
-	assert!(matches!(res, Err(ReturnErrorCode::CalleeTrapped)));
+	assert!(matches!(res, Err(ReturnErrorCode::OutOfResources)));
 
 	// Fail to call the contract due to insufficient proof_size weight.
+	let mut output = [0u8; 4];
 	let res = api::call(
 		uapi::CallFlags::empty(),
-		callee,
-		0u64, // How much ref_time weight to devote for the execution. 0 = all.
-		1u64, // too little proof_size weight
-		None, // No deposit limit.
+		&callee,
+		u64::MAX, // How much ref_time weight to devote for the execution. u64::MAX = use all.
+		load_code_proof_size, // just enough to load the contract
+		&[u8::MAX; 32], // No deposit limit.
 		&value,
-		&input,
-		None,
+		&INPUT,
+		Some(&mut &mut output[..]),
 	);
-	assert!(matches!(res, Err(ReturnErrorCode::CalleeTrapped)));
+	assert!(matches!(res, Err(ReturnErrorCode::CalleeReverted)));
+
+	let mut decode_buf = [0u8; 4];
+	decode_buf[..4].copy_from_slice(&output[..4]);
+	assert_eq!(u32::from_le_bytes(decode_buf), ReturnErrorCode::OutOfResources as u32);
 
 	// Call the contract successfully.
 	let mut output = [0u8; 4];
 	api::call(
 		uapi::CallFlags::empty(),
-		callee,
-		0u64, // How much ref_time weight to devote for the execution. 0 = all.
-		0u64, // How much proof_size weight to devote for the execution. 0 = all.
-		None, // No deposit limit.
+		&callee,
+		u64::MAX, // How much ref_time weight to devote for the execution. u64::MAX = use all.
+		u64::MAX, // How much proof_size weight to devote for the execution. u64::MAX = use all.
+		&[u8::MAX; 32], // No deposit limit.
 		&value,
-		&input,
+		&INPUT,
 		Some(&mut &mut output[..]),
 	)
 	.unwrap();
-	assert_eq!(&output, &input[4..])
+	assert_eq!(&output, &INPUT[4..])
 }

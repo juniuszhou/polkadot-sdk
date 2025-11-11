@@ -17,6 +17,7 @@
 
 //! Substrate blockchain trait
 
+use codec::{Decode, Encode};
 use parking_lot::RwLock;
 use sp_runtime::{
 	generic::BlockId,
@@ -109,7 +110,7 @@ pub trait ForkBackend<Block: BlockT>:
 					for block in tree_route.retracted() {
 						expanded_forks.insert(block.hash);
 					}
-					continue
+					continue;
 				},
 				Err(_) => {
 					// There are cases when blocks are missing (e.g. warp-sync).
@@ -196,7 +197,7 @@ pub trait Backend<Block: BlockT>:
 			let info = self.info();
 			if info.finalized_number > *base_header.number() {
 				// `base_header` is on a dead fork.
-				return Ok(None)
+				return Ok(None);
 			}
 			self.leaves()?
 		};
@@ -207,7 +208,7 @@ pub trait Backend<Block: BlockT>:
 			// go backwards through the chain (via parent links)
 			loop {
 				if current_hash == base_hash {
-					return Ok(Some(leaf_hash))
+					return Ok(Some(leaf_hash));
 				}
 
 				let current_header = self
@@ -216,7 +217,7 @@ pub trait Backend<Block: BlockT>:
 
 				// stop search in this chain once we go below the target's block number
 				if current_header.number() < base_header.number() {
-					break
+					break;
 				}
 
 				current_hash = *current_header.parent_hash();
@@ -252,7 +253,13 @@ pub trait Backend<Block: BlockT>:
 		&self,
 		finalized_block_hash: Block::Hash,
 		finalized_block_number: NumberFor<Block>,
+		finalized_block_parent_hash: Block::Hash,
 	) -> std::result::Result<DisplacedLeavesAfterFinalization<Block>, Error> {
+		// There are no forks at genesis.
+		if finalized_block_number.is_zero() {
+			return Ok(DisplacedLeavesAfterFinalization::default());
+		}
+
 		let leaves = self.leaves()?;
 
 		let now = std::time::Instant::now();
@@ -264,37 +271,14 @@ pub trait Backend<Block: BlockT>:
 			"Checking for displaced leaves after finalization."
 		);
 
-		// If we have only one leaf there are no forks, and we can return early.
-		if finalized_block_number == Zero::zero() || leaves.len() == 1 {
-			return Ok(DisplacedLeavesAfterFinalization::default())
-		}
-
 		// Store hashes of finalized blocks for quick checking later, the last block is the
 		// finalized one
 		let mut finalized_chain = VecDeque::new();
-		let current_finalized = match self.header_metadata(finalized_block_hash) {
-			Ok(metadata) => metadata,
-			Err(Error::UnknownBlock(_)) => {
-				debug!(
-					target: crate::LOG_TARGET,
-					hash = ?finalized_block_hash,
-					elapsed = ?now.elapsed(),
-					"Tried to fetch unknown block, block ancestry has gaps.",
-				);
-				return Ok(DisplacedLeavesAfterFinalization::default());
-			},
-			Err(e) => {
-				debug!(
-					target: crate::LOG_TARGET,
-					hash = ?finalized_block_hash,
-					err = ?e,
-					elapsed = ?now.elapsed(),
-					"Failed to fetch block.",
-				);
-				return Err(e);
-			},
-		};
-		finalized_chain.push_front(MinimalBlockMetadata::from(&current_finalized));
+		finalized_chain.push_front(MinimalBlockMetadata {
+			number: finalized_block_number,
+			hash: finalized_block_hash,
+			parent: finalized_block_parent_hash,
+		});
 
 		// Local cache is a performance optimization in case of finalized block deep below the
 		// tip of the chain with a lot of leaves above finalized block
@@ -332,7 +316,7 @@ pub trait Backend<Block: BlockT>:
 					elapsed = ?now.elapsed(),
 					"Added genesis leaf to displaced leaves."
 				);
-				continue
+				continue;
 			}
 
 			debug!(
@@ -539,6 +523,29 @@ impl<Block: BlockT> DisplacedLeavesAfterFinalization<Block> {
 	}
 }
 
+/// Represents the type of block gaps that may result from either warp sync or fast sync.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Encode, Decode)]
+pub enum BlockGapType {
+	/// Both the header and body are missing, as a result of warp sync.
+	MissingHeaderAndBody,
+	/// The block body is missing, as a result of fast sync.
+	MissingBody,
+}
+
+/// Represents the block gap resulted by warp sync or fast sync.
+///
+/// A block gap is a range of blocks where either the bodies, or both headers and bodies are
+/// missing.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Encode, Decode)]
+pub struct BlockGap<N> {
+	/// The starting block number of the gap (inclusive).
+	pub start: N,
+	/// The ending block number of the gap (inclusive).
+	pub end: N,
+	/// The type of gap.
+	pub gap_type: BlockGapType,
+}
+
 /// Blockchain info
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct Info<Block: BlockT> {
@@ -556,8 +563,8 @@ pub struct Info<Block: BlockT> {
 	pub finalized_state: Option<(Block::Hash, <<Block as BlockT>::Header as HeaderT>::Number)>,
 	/// Number of concurrent leave forks.
 	pub number_leaves: usize,
-	/// Missing blocks after warp sync. (start, end).
-	pub block_gap: Option<(NumberFor<Block>, NumberFor<Block>)>,
+	/// Missing blocks after warp sync or fast sync.
+	pub block_gap: Option<BlockGap<NumberFor<Block>>>,
 }
 
 /// Block status.

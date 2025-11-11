@@ -17,9 +17,9 @@
 
 #![no_std]
 #![no_main]
+include!("../panic_handler.rs");
 
-use common::input;
-use uapi::{HostFn, HostFnImpl as api};
+use uapi::{input, HostFn, HostFnImpl as api};
 
 #[no_mangle]
 #[polkavm_derive::polkavm_export]
@@ -28,8 +28,8 @@ pub extern "C" fn deploy() {}
 #[no_mangle]
 #[polkavm_derive::polkavm_export]
 pub extern "C" fn call() {
-	input!(addr: [u8; 32],);
-	api::set_code_hash(addr).unwrap();
+	input!(addr: &[u8; 32],);
+	api::set_code_hash(addr);
 
 	// we return 1 after setting new code_hash
 	// next `call` will NOT return this value, because contract code has been changed

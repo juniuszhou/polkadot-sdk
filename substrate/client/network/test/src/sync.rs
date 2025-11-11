@@ -749,24 +749,6 @@ async fn sync_blocks_when_block_announce_validator_says_it_is_new_best() {
 	}
 }
 
-/// Waits for some time until the validation is successful.
-struct DeferredBlockAnnounceValidator;
-
-impl BlockAnnounceValidator<Block> for DeferredBlockAnnounceValidator {
-	fn validate(
-		&mut self,
-		_: &Header,
-		_: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<Validation, Box<dyn std::error::Error + Send>>> + Send>>
-	{
-		async {
-			futures_timer::Delay::new(std::time::Duration::from_millis(500)).await;
-			Ok(Validation::Success { is_new_best: false })
-		}
-		.boxed()
-	}
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_until_deferred_block_announce_validation_is_ready() {
 	sp_tracing::try_init_simple();
@@ -844,6 +826,7 @@ async fn sync_to_tip_requires_that_sync_protocol_is_informed_about_best_block() 
 
 /// Ensures that if we as a syncing node sync to the tip while we are connected to another peer
 /// that is currently also doing a major sync.
+#[cfg(ignore_flaky_test)] // https://github.com/paritytech/polkadot-sdk/issues/48
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sync_to_tip_when_we_sync_together_with_multiple_peers() {
 	sp_tracing::try_init_simple();

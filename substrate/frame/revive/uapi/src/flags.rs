@@ -20,9 +20,10 @@ use bitflags::bitflags;
 bitflags! {
 	/// Flags used by a contract to customize exit behaviour.
 	#[cfg_attr(feature = "scale", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
+	#[derive(Default)]
 	pub struct ReturnFlags: u32 {
 		/// If this bit is set all changes made by the contract execution are rolled back.
-		const REVERT = 0x0000_0001;
+		const REVERT = 0b0000_0001;
 	}
 }
 
@@ -37,7 +38,7 @@ bitflags! {
 		///
 		/// A forwarding call will consume the current contracts input. Any attempt to
 		/// access the input after this call returns will lead to [`Error::InputForwarded`].
-		/// It does not matter if this is due to calling `seal_input` or trying another
+		/// It does not matter if this is due to calling `call_data_copy` or trying another
 		/// forwarding call. Consider using [`Self::CLONE_INPUT`] in order to preserve
 		/// the input.
 		const FORWARD_INPUT = 0b0000_0001;

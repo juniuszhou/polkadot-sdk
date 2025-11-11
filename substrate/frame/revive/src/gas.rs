@@ -14,9 +14,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-use crate::{exec::ExecError, weights::WeightInfo, Config, Error};
-use core::marker::PhantomData;
+use crate::{exec::ExecError, vm::evm::Halt, weights::WeightInfo, Config, Error};
+use core::{marker::PhantomData, ops::ControlFlow};
 use frame_support::{
 	dispatch::{DispatchErrorWithPostInfo, DispatchResultWithPostInfo, PostDispatchInfo},
 	weights::Weight,
@@ -73,13 +72,12 @@ impl<T: Config> EngineMeter<T> {
 
 	/// How much ref time does each PolkaVM gas correspond to.
 	fn ref_time_per_fuel() -> u64 {
-		// We execute 6 different instructions therefore we have to divide the actual
-		// computed gas costs by 6 to have a rough estimate as to how expensive each
-		// single executed instruction is going to be.
-		let instr_cost = T::WeightInfo::instr_i64_load_store(1)
-			.saturating_sub(T::WeightInfo::instr_i64_load_store(0))
+		let loop_iteration =
+			T::WeightInfo::instr(1).saturating_sub(T::WeightInfo::instr(0)).ref_time();
+		let empty_loop_iteration = T::WeightInfo::instr_empty_loop(1)
+			.saturating_sub(T::WeightInfo::instr_empty_loop(0))
 			.ref_time();
-		instr_cost / 6
+		loop_iteration.saturating_sub(empty_loop_iteration)
 	}
 }
 
@@ -91,7 +89,7 @@ pub struct RefTimeLeft(u64);
 
 /// Resource that needs to be synced to the executor.
 ///
-/// Wrapped to make sure that the resource will be synced back the the executor.
+/// Wrapped to make sure that the resource will be synced back to the executor.
 #[must_use]
 pub struct Syncable(polkavm::Gas);
 
@@ -170,25 +168,19 @@ impl<T: Config> GasMeter<T> {
 		}
 	}
 
-	/// Create a new gas meter by removing gas from the current meter.
+	/// Create a new gas meter by removing *all* the gas from the current meter.
 	///
-	/// # Note
-	///
-	/// Passing `0` as amount is interpreted as "all remaining gas".
+	/// This should only be used by the primordial frame in a sequence of calls - every subsequent
+	/// frame should use [`nested`](Self::nested).
+	pub fn nested_take_all(&mut self) -> Self {
+		let gas_left = self.gas_left;
+		self.gas_left -= gas_left;
+		GasMeter::new(gas_left)
+	}
+
+	/// Create a new gas meter for a nested call by removing gas from the current meter.
 	pub fn nested(&mut self, amount: Weight) -> Self {
-		let amount = Weight::from_parts(
-			if amount.ref_time().is_zero() {
-				self.gas_left().ref_time()
-			} else {
-				amount.ref_time()
-			},
-			if amount.proof_size().is_zero() {
-				self.gas_left().proof_size()
-			} else {
-				amount.proof_size()
-			},
-		)
-		.min(self.gas_left);
+		let amount = amount.min(self.gas_left);
 		self.gas_left -= amount;
 		GasMeter::new(amount)
 	}
@@ -224,6 +216,15 @@ impl<T: Config> GasMeter<T> {
 		// any action
 		self.gas_left = self.gas_left.checked_sub(&amount).ok_or_else(|| Error::<T>::OutOfGas)?;
 		Ok(ChargedAmount(amount))
+	}
+
+	/// Charge the specified token amount of gas or halt if not enough gas is left.
+	pub fn charge_or_halt<Tok: Token<T>>(
+		&mut self,
+		token: Tok,
+	) -> ControlFlow<Halt, ChargedAmount> {
+		self.charge(token)
+			.map_or_else(|_| ControlFlow::Break(Error::<T>::OutOfGas.into()), ControlFlow::Continue)
 	}
 
 	/// Adjust a previously charged amount down to its actual amount.
@@ -319,6 +320,10 @@ impl<T: Config> GasMeter<T> {
 	pub fn tokens(&self) -> &[ErasedToken] {
 		&self.tokens
 	}
+
+	pub fn consume_all(&mut self) {
+		self.gas_left = Zero::zero();
+	}
 }
 
 #[cfg(test)]
@@ -392,6 +397,50 @@ mod tests {
 	fn refuse_to_execute_anything_if_zero() {
 		let mut gas_meter = GasMeter::<Test>::new(Weight::zero());
 		assert!(gas_meter.charge(SimpleToken(1)).is_err());
+	}
+
+	/// Previously, passing a `Weight` of 0 to `nested` would consume all of the meter's current
+	/// gas.
+	///
+	/// Now, a `Weight` of 0 means no gas for the nested call.
+	#[test]
+	fn nested_zero_gas_requested() {
+		let test_weight = 50000.into();
+		let mut gas_meter = GasMeter::<Test>::new(test_weight);
+		let gas_for_nested_call = gas_meter.nested(0.into());
+
+		assert_eq!(gas_meter.gas_left(), 50000.into());
+		assert_eq!(gas_for_nested_call.gas_left(), 0.into())
+	}
+
+	#[test]
+	fn nested_some_gas_requested() {
+		let test_weight = 50000.into();
+		let mut gas_meter = GasMeter::<Test>::new(test_weight);
+		let gas_for_nested_call = gas_meter.nested(10000.into());
+
+		assert_eq!(gas_meter.gas_left(), 40000.into());
+		assert_eq!(gas_for_nested_call.gas_left(), 10000.into())
+	}
+
+	#[test]
+	fn nested_all_gas_requested() {
+		let test_weight = Weight::from_parts(50000, 50000);
+		let mut gas_meter = GasMeter::<Test>::new(test_weight);
+		let gas_for_nested_call = gas_meter.nested(test_weight);
+
+		assert_eq!(gas_meter.gas_left(), Weight::from_parts(0, 0));
+		assert_eq!(gas_for_nested_call.gas_left(), 50_000.into())
+	}
+
+	#[test]
+	fn nested_excess_gas_requested() {
+		let test_weight = Weight::from_parts(50000, 50000);
+		let mut gas_meter = GasMeter::<Test>::new(test_weight);
+		let gas_for_nested_call = gas_meter.nested(test_weight + 10000.into());
+
+		assert_eq!(gas_meter.gas_left(), Weight::from_parts(0, 0));
+		assert_eq!(gas_for_nested_call.gas_left(), 50_000.into())
 	}
 
 	// Make sure that the gas meter does not charge in case of overcharge

@@ -17,13 +17,18 @@
 
 //! A crate that hosts a common definitions that are relevant for the pallet-revive.
 
-use alloc::vec::Vec;
+use crate::{
+	evm::DryRunConfig, mock::MockHandler, storage::WriteOutcome, BalanceOf, Config, Time, H160,
+	U256,
+};
+use alloc::{boxed::Box, fmt::Debug, string::String, vec::Vec};
 use codec::{Decode, Encode, MaxEncodedLen};
 use frame_support::weights::Weight;
 use pallet_revive_uapi::ReturnFlags;
 use scale_info::TypeInfo;
+use sp_core::Get;
 use sp_runtime::{
-	traits::{Saturating, Zero},
+	traits::{One, Saturating, Zero},
 	DispatchError, RuntimeDebug,
 };
 
@@ -38,7 +43,7 @@ use sp_runtime::{
 /// `ContractsApi` version. Therefore when SCALE decoding a `ContractResult` its trailing data
 /// should be ignored to avoid any potential compatibility issues.
 #[derive(Clone, Eq, PartialEq, Encode, Decode, RuntimeDebug, TypeInfo)]
-pub struct ContractResult<R, Balance, EventRecord> {
+pub struct ContractResult<R, Balance> {
 	/// How much weight was consumed during execution.
 	pub gas_consumed: Weight,
 	/// How much weight is required as gas limit in order to execute this call.
@@ -47,7 +52,7 @@ pub struct ContractResult<R, Balance, EventRecord> {
 	///
 	/// # Note
 	///
-	/// This can only different from [`Self::gas_consumed`] when weight pre charging
+	/// This can only be different from [`Self::gas_consumed`] when weight pre charging
 	/// is used. Currently, only `seal_call_runtime` makes use of pre charging.
 	/// Additionally, any `seal_call` or `seal_instantiate` makes use of pre-charging
 	/// when a non-zero `gas_limit` argument is supplied.
@@ -59,42 +64,108 @@ pub struct ContractResult<R, Balance, EventRecord> {
 	/// is `Err`. This is because on error all storage changes are rolled back including the
 	/// payment of the deposit.
 	pub storage_deposit: StorageDeposit<Balance>,
-	/// An optional debug message. This message is only filled when explicitly requested
-	/// by the code that calls into the contract. Otherwise it is empty.
-	///
-	/// The contained bytes are valid UTF-8. This is not declared as `String` because
-	/// this type is not allowed within the runtime.
-	///
-	/// Clients should not make any assumptions about the format of the buffer.
-	/// They should just display it as-is. It is **not** only a collection of log lines
-	/// provided by a contract but a formatted buffer with different sections.
-	///
-	/// # Note
-	///
-	/// The debug message is never generated during on-chain execution. It is reserved for
-	/// RPC calls.
-	pub debug_message: Vec<u8>,
-	/// The execution result of the wasm code.
-	pub result: R,
-	/// The events that were emitted during execution. It is an option as event collection is
-	/// optional.
-	pub events: Option<Vec<EventRecord>>,
+	/// The execution result of the vm binary code.
+	pub result: Result<R, DispatchError>,
 }
 
-/// Result type of a `bare_call` call as well as `ContractsApi::call`.
-pub type ContractExecResult<Balance, EventRecord> =
-	ContractResult<Result<ExecReturnValue, DispatchError>, Balance, EventRecord>;
+/// The result of the execution of a `eth_transact` call.
+#[derive(Clone, Eq, PartialEq, Default, Encode, Decode, RuntimeDebug, TypeInfo)]
+pub struct EthTransactInfo<Balance> {
+	/// The amount of gas that was necessary to execute the transaction.
+	pub gas_required: Weight,
+	/// Storage deposit charged.
+	pub storage_deposit: Balance,
+	/// The weight and deposit equivalent in EVM Gas.
+	pub eth_gas: U256,
+	/// The execution return value.
+	pub data: Vec<u8>,
+}
 
-/// Result type of a `bare_instantiate` call as well as `ContractsApi::instantiate`.
-pub type ContractInstantiateResult<AccountId, Balance, EventRecord> =
-	ContractResult<Result<InstantiateReturnValue<AccountId>, DispatchError>, Balance, EventRecord>;
+/// Error type of a `eth_transact` call.
+#[derive(Clone, Eq, PartialEq, Encode, Decode, RuntimeDebug, TypeInfo)]
+pub enum EthTransactError {
+	Data(Vec<u8>),
+	Message(String),
+}
+
+#[derive(Clone, Eq, PartialEq, Encode, Decode, RuntimeDebug, TypeInfo)]
+/// Error encountered while creating a BalanceWithDust from a U256 balance.
+pub enum BalanceConversionError {
+	/// Error encountered while creating the main balance value.
+	Value,
+	/// Error encountered while creating the dust value.
+	Dust,
+}
+
+/// A Balance amount along with some "dust" to represent the lowest decimals that can't be expressed
+/// in the native currency
+#[derive(Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug)]
+pub struct BalanceWithDust<Balance> {
+	/// The value expressed in the native currency
+	value: Balance,
+	/// The dust, representing up to 1 unit of the native currency.
+	/// The dust is bounded between 0 and `crate::Config::NativeToEthRatio`
+	dust: u32,
+}
+
+impl<Balance> From<Balance> for BalanceWithDust<Balance> {
+	fn from(value: Balance) -> Self {
+		Self { value, dust: 0 }
+	}
+}
+
+impl<Balance> BalanceWithDust<Balance> {
+	/// Deconstructs the `BalanceWithDust` into its components.
+	pub fn deconstruct(self) -> (Balance, u32) {
+		(self.value, self.dust)
+	}
+
+	/// Creates a new `BalanceWithDust` with the given value and dust.
+	pub fn new_unchecked<T: Config>(value: Balance, dust: u32) -> Self {
+		debug_assert!(dust < T::NativeToEthRatio::get());
+		Self { value, dust }
+	}
+
+	/// Creates a new `BalanceWithDust` from the given EVM value.
+	pub fn from_value<T: Config>(
+		value: U256,
+	) -> Result<BalanceWithDust<BalanceOf<T>>, BalanceConversionError> {
+		if value.is_zero() {
+			return Ok(Default::default())
+		}
+
+		let (quotient, remainder) = value.div_mod(T::NativeToEthRatio::get().into());
+		let value = quotient.try_into().map_err(|_| BalanceConversionError::Value)?;
+		let dust = remainder.try_into().map_err(|_| BalanceConversionError::Dust)?;
+
+		Ok(BalanceWithDust { value, dust })
+	}
+}
+
+impl<Balance: Zero + One + Saturating> BalanceWithDust<Balance> {
+	/// Returns true if both the value and dust are zero.
+	pub fn is_zero(&self) -> bool {
+		self.value.is_zero() && self.dust == 0
+	}
+
+	/// Returns the Balance rounded to the nearest whole unit if the dust is non-zero.
+	pub fn into_rounded_balance(self) -> Balance {
+		if self.dust == 0 {
+			self.value
+		} else {
+			self.value.saturating_add(Balance::one())
+		}
+	}
+}
 
 /// Result type of a `bare_code_upload` call.
-pub type CodeUploadResult<CodeHash, Balance> =
-	Result<CodeUploadReturnValue<CodeHash, Balance>, DispatchError>;
+pub type CodeUploadResult<Balance> = Result<CodeUploadReturnValue<Balance>, DispatchError>;
 
 /// Result type of a `get_storage` call.
 pub type GetStorageResult = Result<Option<Vec<u8>>, ContractAccessError>;
+
+/// Result type of a `set_storage` call.
+pub type SetStorageResult = Result<WriteOutcome, ContractAccessError>;
 
 /// The possible errors that can happen querying the storage of a contract.
 #[derive(Copy, Clone, Eq, PartialEq, Encode, Decode, MaxEncodedLen, RuntimeDebug, TypeInfo)]
@@ -103,12 +174,12 @@ pub enum ContractAccessError {
 	DoesntExist,
 	/// Storage key cannot be decoded from the provided input data.
 	KeyDecodingFailed,
-	/// Storage is migrating. Try again later.
-	MigrationInProgress,
+	/// Writing to storage failed.
+	StorageWriteFailed(DispatchError),
 }
 
 /// Output of a contract call or instantiation which ran to completion.
-#[derive(Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug, TypeInfo)]
+#[derive(Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug, TypeInfo, Default)]
 pub struct ExecReturnValue {
 	/// Flags passed along by `seal_return`. Empty when `seal_return` was never called.
 	pub flags: ReturnFlags,
@@ -125,29 +196,29 @@ impl ExecReturnValue {
 
 /// The result of a successful contract instantiation.
 #[derive(Clone, PartialEq, Eq, Encode, Decode, RuntimeDebug, TypeInfo)]
-pub struct InstantiateReturnValue<AccountId> {
+pub struct InstantiateReturnValue {
 	/// The output of the called constructor.
 	pub result: ExecReturnValue,
-	/// The account id of the new contract.
-	pub account_id: AccountId,
+	/// The address of the new contract.
+	pub addr: H160,
 }
 
 /// The result of successfully uploading a contract.
 #[derive(Clone, PartialEq, Eq, Encode, Decode, MaxEncodedLen, RuntimeDebug, TypeInfo)]
-pub struct CodeUploadReturnValue<CodeHash, Balance> {
+pub struct CodeUploadReturnValue<Balance> {
 	/// The key under which the new code is stored.
-	pub code_hash: CodeHash,
+	pub code_hash: sp_core::H256,
 	/// The deposit that was reserved at the caller. Is zero when the code already existed.
 	pub deposit: Balance,
 }
 
-/// Reference to an existing code hash or a new wasm module.
+/// Reference to an existing code hash or a new vm module.
 #[derive(Clone, Eq, PartialEq, Encode, Decode, RuntimeDebug, TypeInfo)]
-pub enum Code<Hash> {
-	/// A wasm module as raw bytes.
+pub enum Code {
+	/// A vm module as raw bytes.
 	Upload(Vec<u8>),
-	/// The code hash of an on-chain wasm blob.
-	Existing(Hash),
+	/// The code hash of an on-chain vm binary blob.
+	Existing(sp_core::H256),
 }
 
 /// The amount of balance that was either charged or refunded in order to pay for storage.
@@ -165,6 +236,17 @@ pub enum StorageDeposit<Balance> {
 	/// This means that the specified amount of balance was transferred from the origin
 	/// to the involved deposit accounts.
 	Charge(Balance),
+}
+
+impl<T, Balance> ContractResult<T, Balance> {
+	pub fn map_result<V>(self, map_fn: impl FnOnce(T) -> V) -> ContractResult<V, Balance> {
+		ContractResult {
+			gas_consumed: self.gas_consumed,
+			gas_required: self.gas_required,
+			storage_deposit: self.storage_deposit,
+			result: self.result.map(map_fn),
+		}
+	}
 }
 
 impl<Balance: Zero> Default for StorageDeposit<Balance> {
@@ -251,35 +333,91 @@ where
 	}
 }
 
-/// Determines whether events should be collected during execution.
-#[derive(
-	Copy, Clone, PartialEq, Eq, RuntimeDebug, Decode, Encode, MaxEncodedLen, scale_info::TypeInfo,
-)]
-pub enum CollectEvents {
-	/// Collect events.
+/// `Stack` wide configuration options.
+pub struct ExecConfig<T: Config> {
+	/// Indicates whether the account nonce should be incremented after instantiating a new
+	/// contract.
 	///
-	/// # Note
+	/// In Substrate, where transactions can be batched, the account's nonce should be incremented
+	/// after each instantiation, ensuring that each instantiation uses a unique nonce.
 	///
-	/// Events should only be collected when called off-chain, as this would otherwise
-	/// collect all the Events emitted in the block so far and put them into the PoV.
+	/// For transactions sent from Ethereum wallets, which cannot be batched, the nonce should only
+	/// be incremented once. In these cases, set this to `false` to suppress an extra nonce
+	/// increment.
 	///
-	/// **Never** use this mode for on-chain execution.
-	UnsafeCollect,
-	/// Skip event collection.
-	Skip,
+	/// Note:
+	/// The origin's nonce is already incremented pre-dispatch by the `CheckNonce` transaction
+	/// extension.
+	///
+	/// This does not apply to contract initiated instantatiations. Those will always bump the
+	/// instantiating contract's nonce.
+	pub bump_nonce: bool,
+	/// Whether deposits will be withdrawn from the pallet_transaction_payment credit (`Some`)
+	/// free balance (`None`).
+	///
+	/// Contains the encoded_len + base weight.
+	pub collect_deposit_from_hold: Option<(u32, Weight)>,
+	/// The gas price that was chosen for this transaction.
+	///
+	/// It is determined when transforming `eth_transact` into a proper extrinsic.
+	pub effective_gas_price: Option<U256>,
+	/// Whether this configuration was created for a dry-run execution.
+	/// Use to enable logic that should only run in dry-run mode.
+	pub is_dry_run: Option<DryRunConfig<<<T as Config>::Time as Time>::Moment>>,
+	/// An optional mock handler that can be used to override certain behaviors.
+	/// This is primarily used for testing purposes and should be `None` in production
+	/// environments.
+	pub mock_handler: Option<Box<dyn MockHandler<T>>>,
 }
 
-/// Determines whether debug messages will be collected.
-#[derive(
-	Copy, Clone, PartialEq, Eq, RuntimeDebug, Decode, Encode, MaxEncodedLen, scale_info::TypeInfo,
-)]
-pub enum DebugInfo {
-	/// Collect debug messages.
-	/// # Note
-	///
-	/// This should only ever be set to `UnsafeDebug` when executing as an RPC because
-	/// it adds allocations and could be abused to drive the runtime into an OOM panic.
-	UnsafeDebug,
-	/// Skip collection of debug messages.
-	Skip,
+impl<T: Config> ExecConfig<T> {
+	/// Create a default config appropriate when the call originated from a substrate tx.
+	pub fn new_substrate_tx() -> Self {
+		Self {
+			bump_nonce: true,
+			collect_deposit_from_hold: None,
+			effective_gas_price: None,
+			is_dry_run: None,
+			mock_handler: None,
+		}
+	}
+
+	pub fn new_substrate_tx_without_bump() -> Self {
+		Self {
+			bump_nonce: false,
+			collect_deposit_from_hold: None,
+			effective_gas_price: None,
+			mock_handler: None,
+			is_dry_run: None,
+		}
+	}
+
+	/// Create a default config appropriate when the call originated from a ethereum tx.
+	pub fn new_eth_tx(effective_gas_price: U256, encoded_len: u32, base_weight: Weight) -> Self {
+		Self {
+			bump_nonce: false,
+			collect_deposit_from_hold: Some((encoded_len, base_weight)),
+			effective_gas_price: Some(effective_gas_price),
+			mock_handler: None,
+			is_dry_run: None,
+		}
+	}
+
+	/// Set this config to be a dry-run.
+	pub fn with_dry_run(
+		mut self,
+		dry_run_config: DryRunConfig<<<T as Config>::Time as Time>::Moment>,
+	) -> Self {
+		self.is_dry_run = Some(dry_run_config);
+		self
+	}
+}
+
+/// Indicates whether the code was removed after the last refcount was decremented.
+#[must_use = "You must handle whether the code was removed or not."]
+pub enum CodeRemoved {
+	/// The code was not removed. (refcount > 0)
+	No,
+	/// The code was removed. (refcount == 0)
+	Yes,
 }

@@ -20,6 +20,8 @@
 #[cfg(test)]
 mod block_import;
 #[cfg(test)]
+mod conformance;
+#[cfg(test)]
 mod fuzz;
 #[cfg(test)]
 mod service;
@@ -66,8 +68,12 @@ use sc_network_sync::{
 	block_request_handler::BlockRequestHandler,
 	service::{network::NetworkServiceProvider, syncing_service::SyncingService},
 	state_request_handler::StateRequestHandler,
-	strategy::warp::{
-		AuthorityList, EncodedProof, SetId, VerificationResult, WarpSyncConfig, WarpSyncProvider,
+	strategy::{
+		polkadot::{PolkadotSyncingStrategy, PolkadotSyncingStrategyConfig},
+		warp::{
+			AuthorityList, EncodedProof, SetId, VerificationResult, WarpSyncConfig,
+			WarpSyncProvider,
+		},
 	},
 	warp_request_handler,
 };
@@ -87,7 +93,7 @@ use sp_runtime::{
 	traits::{Block as BlockT, Header as HeaderT, NumberFor, Zero},
 	Justification, Justifications,
 };
-use substrate_test_runtime_client::AccountKeyring;
+use substrate_test_runtime_client::Sr25519Keyring;
 pub use substrate_test_runtime_client::{
 	runtime::{Block, ExtrinsicBuilder, Hash, Header, Transfer},
 	TestClient, TestClientBuilder, TestClientBuilderExt,
@@ -471,8 +477,8 @@ where
 				BlockOrigin::File,
 				|mut builder| {
 					let transfer = Transfer {
-						from: AccountKeyring::Alice.into(),
-						to: AccountKeyring::Alice.into(),
+						from: Sr25519Keyring::Alice.into(),
+						to: Sr25519Keyring::Alice.into(),
 						amount: 1,
 						nonce,
 					};
@@ -624,9 +630,8 @@ struct VerifierAdapter<B: BlockT> {
 impl<B: BlockT> Verifier<B> for VerifierAdapter<B> {
 	async fn verify(&self, block: BlockImportParams<B>) -> Result<BlockImportParams<B>, String> {
 		let hash = block.header.hash();
-		self.verifier.lock().await.verify(block).await.map_err(|e| {
+		self.verifier.lock().await.verify(block).await.inspect_err(|e| {
 			self.failed_verifications.lock().insert(hash, e.clone());
-			e
 		})
 	}
 }
@@ -668,7 +673,7 @@ impl<B: BlockT> WarpSyncProvider<B> for TestWarpSyncProvider<B> {
 	) -> Result<VerificationResult<B>, Box<dyn std::error::Error + Send + Sync>> {
 		let EncodedProof(encoded) = proof;
 		let header = B::Header::decode(&mut encoded.as_slice()).unwrap();
-		Ok(VerificationResult::Complete(0, Default::default(), header))
+		Ok(VerificationResult::Complete(0, Default::default(), header, Default::default()))
 	}
 	fn current_authorities(&self) -> AuthorityList {
 		Default::default()
@@ -830,8 +835,8 @@ pub trait TestNetFactory: Default + Sized + Send {
 
 		let fork_id = Some(String::from("test-fork-id"));
 
-		let (chain_sync_network_provider, chain_sync_network_handle) =
-			NetworkServiceProvider::new();
+		let chain_sync_network_provider = NetworkServiceProvider::new();
+		let chain_sync_network_handle = chain_sync_network_provider.handle();
 		let mut block_relay_params = BlockRequestHandler::new::<NetworkWorker<_, _>>(
 			chain_sync_network_handle.clone(),
 			&protocol_id,
@@ -905,6 +910,26 @@ pub trait TestNetFactory: Default + Sized + Send {
 			<Block as BlockT>::Hash,
 		>>::register_notification_metrics(None);
 
+		let syncing_config = PolkadotSyncingStrategyConfig {
+			mode: network_config.sync_mode,
+			max_parallel_downloads: network_config.max_parallel_downloads,
+			max_blocks_per_request: network_config.max_blocks_per_request,
+			metrics_registry: None,
+			state_request_protocol_name: state_request_protocol_config.name.clone(),
+			block_downloader: block_relay_params.downloader,
+			min_peers_to_start_warp_sync: None,
+		};
+		// Initialize syncing strategy.
+		let syncing_strategy = Box::new(
+			PolkadotSyncingStrategy::new(
+				syncing_config,
+				client.clone(),
+				Some(warp_sync_config),
+				Some(warp_protocol_config.name.clone()),
+			)
+			.unwrap(),
+		);
+
 		let (engine, sync_service, block_announce_config) =
 			sc_network_sync::engine::SyncingEngine::new(
 				Roles::from(if config.is_authority { &Role::Authority } else { &Role::Full }),
@@ -913,18 +938,14 @@ pub trait TestNetFactory: Default + Sized + Send {
 				metrics,
 				&full_net_config,
 				protocol_id.clone(),
-				&fork_id,
+				fork_id.as_deref(),
 				block_announce_validator,
-				Some(warp_sync_config),
+				syncing_strategy,
 				chain_sync_network_handle,
 				import_queue.service(),
-				block_relay_params.downloader,
-				state_request_protocol_config.name.clone(),
-				Some(warp_protocol_config.name.clone()),
 				peer_store_handle.clone(),
 			)
 			.unwrap();
-		let sync_service_import_queue = Box::new(sync_service.clone());
 		let sync_service = Arc::new(sync_service.clone());
 
 		for config in config.request_response_protocols {
@@ -968,8 +989,12 @@ pub trait TestNetFactory: Default + Sized + Send {
 			chain_sync_network_provider.run(service).await;
 		});
 
-		tokio::spawn(async move {
-			import_queue.run(sync_service_import_queue).await;
+		tokio::spawn({
+			let sync_service = sync_service.clone();
+
+			async move {
+				import_queue.run(sync_service.as_ref()).await;
+			}
 		});
 
 		tokio::spawn(async move {
